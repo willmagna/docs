@@ -1,0 +1,262 @@
+captainVersion: 4
+
+services:
+  "$$cap_appname-backend":
+    image: willmagna/frappe-all-apps:2.0
+    networks:
+      - "$$cap_appname-frappe_network"
+    deploy:
+      restart_policy:
+        condition: on-failure
+    volumes:
+      - "$$cap_appname-sites:/home/frappe/frappe-bench/sites"
+      - "$$cap_appname-logs:/home/frappe/frappe-bench/logs"
+    environment:
+      DB_HOST: srv-captain--$$cap_appname-db
+      DB_PORT: "3306"
+      MYSQL_ROOT_PASSWORD: $$MYSQL_ROOT_PASSWORD
+      MARIADB_ROOT_PASSWORD: $$MYSQL_ROOT_PASSWORD
+    caproverExtra:
+      notExposeAsWebApp: "true"
+
+  "$$cap_appname-configurator":
+    image: willmagna/frappe-all-apps:2.0
+    networks:
+      - "$$cap_appname-frappe_network"
+    deploy:
+      restart_policy:
+        condition: on-failure
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host srv-captain--$$cap_appname-db;
+        bench set-config -gp db_port 3306;
+        bench set-config -g redis_cache "redis://srv-captain--$$cap_appname-redis-cache:6379";
+        bench set-config -g redis_queue "redis://srv-captain--$$cap_appname-redis-queue:6379";
+        bench set-config -g redis_socketio "redis://srv-captain--$$cap_appname-redis-socketio:6379";
+        bench set-config -gp socketio_port 9000;
+        tail -f /dev/null;
+    environment:
+      DB_HOST: srv-captain--$$cap_appname-db
+      DB_PORT: "3306"
+      REDIS_CACHE: srv-captain--$$cap_appname-redis-cache:6379
+      REDIS_QUEUE: srv-captain--$$cap_appname-redis-queue:6379
+      SOCKETIO_PORT: "9000"
+    volumes:
+      - "$$cap_appname-sites:/home/frappe/frappe-bench/sites"
+      - "$$cap_appname-logs:/home/frappe/frappe-bench/logs"
+    caproverExtra:
+      notExposeAsWebApp: "true"
+
+  "$$cap_appname-create-site":
+    image: willmagna/frappe-all-apps:2.0
+    networks:
+      - "$$cap_appname-frappe_network"
+    deploy:
+      restart_policy:
+        condition: on-failure
+    volumes:
+      - "$$cap_appname-sites:/home/frappe/frappe-bench/sites"
+      - "$$cap_appname-logs:/home/frappe/frappe-bench/logs"
+    entrypoint: ["/bin/sh", "-c"]
+    caproverExtra:
+      notExposeAsWebApp: "true"
+    command:
+      - >
+        apt update && apt install -y netcat;
+        curl -s https://raw.githubusercontent.com/vishnubob/wait-for-it/master/wait-for-it.sh -o /usr/local/bin/wait-for-it;
+        chmod +x /usr/local/bin/wait-for-it;
+        wait-for-it -t 120 srv-captain--$$cap_appname-db:3306;
+        wait-for-it -t 120 srv-captain--$$cap_appname-redis-cache:6379;
+        wait-for-it -t 120 srv-captain--$$cap_appname-redis-queue:6379;
+        export start=`date +%s`;
+        until [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".db_host // empty"` ]] && \
+          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_cache // empty"` ]] && \
+          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_queue // empty"` ]];
+        do
+          echo "Waiting for sites/common_site_config.json to be created";
+          sleep 5;
+          if (( `date +%s`-start > 120 )); then
+            echo "could not find sites/common_site_config.json with required keys";
+            exit 1
+          fi
+        done;
+        echo "sites/common_site_config.json found";
+        bench new-site --mariadb-user-host-login-scope='%' --admin-password=$$ADMIN_PASSWORD --db-root-username=root --db-root-password=$$MYSQL_ROOT_PASSWORD --install-app erpnext --set-default srv-captain--$$cap_appname-frontend;
+        bench --site srv-captain--$$cap_appname-frontend install-app hrms;
+        bench --site srv-captain--$$cap_appname-frontend install-app helpdesk;
+        bench --site srv-captain--$$cap_appname-frontend install-app payments;
+        bench --site srv-captain--$$cap_appname-frontend install-app insights;
+        tail -f /dev/null;
+
+  "$$cap_appname-db":
+    image: mariadb:11.4.5
+    deploy:
+      restart_policy:
+        condition: on-failure
+    environment:
+      MYSQL_ROOT_PASSWORD: $$MYSQL_ROOT_PASSWORD
+      MARIADB_ROOT_PASSWORD: $$MYSQL_ROOT_PASSWORD
+    volumes:
+      - "$$cap_appname-db-data:/var/lib/mysql"
+    networks:
+      - "$$cap_appname-frappe_network"
+    caproverExtra:
+      notExposeAsWebApp: "true"
+
+  "$$cap_appname-frontend":
+    image: willmagna/frappe-all-apps:2.0
+    networks:
+      - "$$cap_appname-frappe_network"
+    depends_on:
+      - "$$cap_appname-websocket"
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command:
+      - nginx-entrypoint.sh
+    environment:
+      BACKEND: srv-captain--$$cap_appname-backend:8000
+      FRAPPE_SITE_NAME_HEADER: srv-captain--$$cap_appname-frontend
+      SOCKETIO: srv-captain--$$cap_appname-websocket:9000
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: 120
+      CLIENT_MAX_BODY_SIZE: 50m
+    volumes:
+      - "$$cap_appname-sites:/home/frappe/frappe-bench/sites"
+      - "$$cap_appname-logs:/home/frappe/frappe-bench/logs"
+    ports:
+      - "$$FRONTEND_PORT:8080"
+    caproverExtra:
+      containerHttpPort: "$$FRONTEND_PORT"
+
+  "$$cap_appname-queue-long":
+    image: willmagna/frappe-all-apps:2.0
+    networks:
+      - "$$cap_appname-frappe_network"
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command:
+      - bench
+      - worker
+      - --queue
+      - long,default,short
+    volumes:
+      - "$$cap_appname-sites:/home/frappe/frappe-bench/sites"
+      - "$$cap_appname-logs:/home/frappe/frappe-bench/logs"
+    caproverExtra:
+      notExposeAsWebApp: "true"
+
+  "$$cap_appname-queue-short":
+    image: willmagna/frappe-all-apps:2.0
+    networks:
+      - "$$cap_appname-frappe_network"
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command:
+      - bench
+      - worker
+      - --queue
+      - short,default
+    volumes:
+      - "$$cap_appname-sites:/home/frappe/frappe-bench/sites"
+      - "$$cap_appname-logs:/home/frappe/frappe-bench/logs"
+    caproverExtra:
+      notExposeAsWebApp: "true"
+
+  "$$cap_appname-redis-queue":
+    image: redis:6.2-alpine
+    networks:
+      - "$$cap_appname-frappe_network"
+    deploy:
+      restart_policy:
+        condition: on-failure
+    volumes:
+      - "$$cap_appname-redis-queue-data:/data"
+
+  "$$cap_appname-redis-cache":
+    image: redis:6.2-alpine
+    networks:
+      - "$$cap_appname-frappe_network"
+    deploy:
+      restart_policy:
+        condition: on-failure
+    caproverExtra:
+      notExposeAsWebApp: "true"
+
+  "$$cap_appname-scheduler":
+    image: willmagna/frappe-all-apps:2.0
+    networks:
+      - "$$cap_appname-frappe_network"
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command:
+      - bench
+      - schedule
+    volumes:
+      - "$$cap_appname-sites:/home/frappe/frappe-bench/sites"
+      - "$$cap_appname-logs:/home/frappe/frappe-bench/logs"
+    caproverExtra:
+      notExposeAsWebApp: "true"
+
+  "$$cap_appname-websocket":
+    image: willmagna/frappe-all-apps:2.0
+    networks:
+      - "$$cap_appname-frappe_network"
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command:
+      - node
+      - /home/frappe/frappe-bench/apps/frappe/socketio.js
+    volumes:
+      - "$$cap_appname-sites:/home/frappe/frappe-bench/sites"
+      - "$$cap_appname-logs:/home/frappe/frappe-bench/logs"
+    caproverExtra:
+      notExposeAsWebApp: "true"
+
+volumes:
+  "$$cap_appname-db-data":
+  "$$cap_appname-redis-queue-data":
+  "$$cap_appname-sites":
+  "$$cap_appname-logs":
+
+networks:
+  "$$cap_appname-frappe_network":
+    driver: bridge
+
+caproverOneClickApp:
+  variables:
+    - id: $$MYSQL_ROOT_PASSWORD
+      label: MySQL Root Password
+      defaultValue: "strongpassword"
+      description: "Password for MySQL root user"
+    - id: $$ADMIN_PASSWORD
+      label: ERPNext Admin Password
+      defaultValue: "secureadminpass"
+      description: "Admin password for ERPNext"
+    - id: $$FRONTEND_PORT
+      label: ERPNext Frontend port
+      defaultValue: "80"
+      description: "Map frontend port"
+
+  instructions:
+    start: |-
+      Deploying ERPNext with MariaDB, Redis, and WebSocket.
+      This may take a few minutes.
+    end: |-
+      Deployment is complete!
+      - Backend: http://$$cap_appname-backend.$$cap_root_domain
+      - Frontend: http://$$cap_appname-frontend.$$cap_root_domain
+      - WebSocket: http://$$cap_appname-websocket.$$cap_root_domain
+
+  displayName: ERPNext
+  isOfficial: false
+  description: "ERPNext One-Click App for CapRover"
+  documentation: "https://github.com/frappe/erpnext"
